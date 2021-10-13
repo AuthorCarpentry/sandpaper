@@ -1,11 +1,22 @@
+library("sandpaper")
 library("pegboard")
+library("purrr")
+library("xml2")
 library("gert")
 library("here")
+library("fs")
 
 src <- here()
+lsn <- tempfile()
+there <- function(...) path(lsn, ...)
+
+repo_path <- getOption("new.sandpaper.repo", 
+  default = paste0("../sandpaper-", basename(getwd()))
+)
+
 pgap <- pegboard::Lesson$new(src)
 # Script to transform the episodes via pegboard with traces
-transform <- function(e, out = src) {
+transform <- function(e, out = lsn) {
   outdir <- fs::path(out, "episodes/")
   cli::cat_rule(fs::path_rel(e$name, out)) # -----------------------------------
   cli::cli_process_start(glue::glue(" converting blockquotes to fenced div"))
@@ -27,23 +38,17 @@ transform <- function(e, out = src) {
   cli::cli_process_done()
 }
 
-# function to remove directories
-dirdel <- Vectorize({function(d) {
-  if (fs::dir_exists(d)) fs::dir_delete(d)
-  invisible()
-}})
-
 # Read and and transform additional files
 rewrite <- function(x, out) {
   tryCatch({
-  ref <- Episode$new(x)
+  ref <- Episode$new(x, process_tags = TRUE, fix_links = TRUE, fix_liquid = TRUE)
   ref$unblock()$use_sandpaper()$write(out)
   }, error = function(e) {
     cli::cli_alert_warning("Error in transformation: {e$message}")
   })
 }
 
-set_config <- function(key, value, path = here()) {
+set_config <- function(key, value, path = lsn) {
   cfg <- sandpaper:::path_config(path)
   l <- readLines(cfg)
   what <- grep(glue::glue("^{key}:"), l)
@@ -51,39 +56,25 @@ set_config <- function(key, value, path = here()) {
   writeLines(l, cfg)
 }
 
-# Create a branch for us to work in
-current_branch <- git_branch()
-message(glue::glue("switching from {current_branch} to sandpaper"))
-if (git_branch_exists("sandpaper")) git_branch_delete("sandpaper")
-git_branch_create("sandpaper", ref = "HEAD", checkout = TRUE)
+# Create lesson
+suppressWarnings(cfg <- yaml::read_yaml(here("_config.yml")))
+create_lesson(lsn, name = cfg$title, open = FALSE)
+file_delete(there("episodes", "01-introduction.Rmd"))
+file_delete(there("index.md"))
 
-# Create a lesson template and remove the git repository
-cfg <- yaml::read_yaml(here("_config.yml"))
-tmp <- tempfile()
-sandpaper::create_lesson(tmp, name = cfg$title, open = FALSE)
 # appending our gitignore file
-file.append(".gitignore", fs::path(tmp, ".gitignore"))
-fs::dir_delete(fs::path(tmp, ".git"))
-fs::file_delete(fs::path(tmp, c("README.md", "index.md", ".gitignore")))
-fs::file_delete(fs::path(tmp, "episodes", "01-introduction.Rmd"))
-fs::file_delete(fs::path(tmp, "learners", "setup.md"))
-fs::file_delete(fs::path(tmp, "instructors", "instructor-notes.md"))
-
-# Copy the components here
-message(glue::glue("copying the sandpaper template on top of the current files"))
-fs::dir_copy(tmp, here(), overwrite = TRUE)
+file.append(there(".gitignore"), here(".gitignore"))
 
 # Modify config file to match as close as possible to the one we have
 message("setting the configuration parameters in config.yaml")
 set_config("title", cfg$title)
 set_config("life_cycle", cfg$life_cycle)
 set_config("contact", cfg$email)
-set_config("branch", current_branch)
 
-if (length(gert::git_remote_list()) == 0) {
+if (length(gert::git_remote_list(repo = src)) == 0) {
   message("Cannot automatically set the following configuration values:\n source: <GITHUB URL>\n carpentry: <CARPENTRY ABBREVIATION>\n\nPlease edit config.yaml to set these values")
 } else {
-  rmt <- gert::git_remote_list()
+  rmt <- gert::git_remote_list(repo = src)
   i <- if (any(i <- rmt$name == "upstream")) which(i) else 1L
   url <- rmt$url[[i]]
   rmt <- gh:::github_remote_parse(rmt$url[[i]])$username
@@ -101,41 +92,44 @@ if (length(gert::git_remote_list()) == 0) {
 
 # Transform and write to our episodes folder
 purrr::walk(pgap$episodes, ~try(transform(.x)))
+set_episodes(lsn, order = names(pgap$episodes), write = TRUE)
+
+# Modify the index to include our magic header
+idx <- list.files(".", pattern = "^index.R?md")
+if (length(idx)) {
+  idx <- if (length(idx) == 2) "index.Rmd" else idx
+  idx <- Episode$new(idx, fix_liquid = TRUE)
+  idx$yaml[length(idx$yaml) + 0:1] <- c("site: sandpaper::sandpaper_site", "---")
+  idx$unblock()$use_sandpaper()
+}
+
+# write episodes, index, and readme
+idx$write(path = path(lsn), format = "md")
+file_copy(here("README.md"), there("README.md"), overwrite = TRUE)
 
 # Transform non-episode MD files
-rewrite(here("_extras", "design.md"), here("instructors"))
+rewrite(here("_extras", "design.md"), there("instructors"))
 # NOTE: quotation is throwing things off here :(
 
-rewrite(here("_extras", "guide.md"), here("instructors"))
+rewrite(here("_extras", "guide.md"), there("instructors"))
 
-rewrite(here("_extras", "discuss.md"), here("learners"))
-rewrite(here("_extras", "exercises.md"), here("learners"))
-rewrite(here("_extras", "figures.md"), here("learners"))
-rewrite(here("reference.md"), here("learners"))
-rewrite(here("setup.md"), here("learners"))
-
-rewrite(here("index.md"), here())
+rewrite(here("_extras", "discuss.md"), there("learners"))
+rewrite(here("_extras", "exercises.md"), there("learners"))
+rewrite(here("_extras", "figures.md"), there("learners"))
+rewrite(here("reference.md"), there("learners"))
+rewrite(here("setup.md"), there("learners"))
 
 # Copy Figures (N.B. this was one of the pain points for the Jekyll lessons: figures lived above the RMarkdown documents)
-fs::dir_create(here("episodes", c("fig", "data", "files")))
-fs::dir_copy(here("fig"), here("episodes"))
-fs::dir_copy(here("files"), here("episodes"))
-fs::dir_copy(here("data"), here("episodes"))
-fs::dir_delete(here(c("data", "fig")))
-
-# Remove unnecessary dirs
-dirdel(c(
-  "_episodes",
-  "_episodes_rmd",
-  "_extras",
-  "_includes",
-  "_layouts",
-  "assets",
-  "bin",
-  "code",
-  "data",
-  "files",
-  "fig"
-))
+fs::dir_copy(here("fig"), there("episodes/fig"), overwrite = TRUE)
+fs::dir_copy(here("files"), there("episodes/files"), overwrite = TRUE)
+fs::dir_copy(here("data"), there("episodes/data"), overwrite = TRUE)
 
 
+cli::cli_alert_info("Copying transformed lesson to {repo_path}")
+dir_copy(lsn, repo_path)
+cli::cli_alert_info("Committing...")
+git_add(".", repo = repo_path)
+git_commit("Transfer lesson to sandpaper",
+  committer = "Carpentries Apprentice <zkamvar+machine@gmail.com>",
+  repo = repo_path
+)
