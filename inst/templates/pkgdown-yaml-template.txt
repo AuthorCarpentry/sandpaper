@@ -8,7 +8,7 @@ home:
   strip_header: true
   description: ~
 template:
-  package: varnish
+  package: {{ package }}{{^package }}varnish{{/package }}
   params:
     time: {{ time }}
     source: {{ source }}
